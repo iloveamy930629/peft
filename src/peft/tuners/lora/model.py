@@ -56,7 +56,6 @@ from .layer import Conv2d, LoraLayer, dispatch_default
 from .torchao import dispatch_torchao
 from .tp_layer import dispatch_megatron
 
-from peft.utils.merge_utils import sce_soft_merge
 from peft.utils.merge_utils import sce
 
 def _adapter_names_pre_forward_hook(target, args, kwargs, adapter_names):
@@ -567,7 +566,7 @@ class LoraModel(BaseTuner):
 
         adapters_ranks = [self.peft_config[adapter].r for adapter in adapters]
         #### Todo: remember to add func names of new methods here here ####
-        if combination_type in ("linear", "ties", "dare_ties", "dare_linear", "magnitude_prune","sce_soft_merge", "sce"):
+        if combination_type in ("linear", "ties", "dare_ties", "dare_linear", "magnitude_prune", "sce"):
             # all adapters ranks should be same, new rank is just this value
             if len(set(adapters_ranks)) != 1:
                 raise ValueError(
@@ -735,7 +734,7 @@ class LoraModel(BaseTuner):
                         driver=svd_driver,
                     )
                 #### Todo: remember to add func names of new methods here here ####
-                elif combination_type in ["linear", "ties", "dare_linear", "dare_ties", "magnitude_prune", "sce_soft_merge", "sce"]:
+                elif combination_type in ["linear", "ties", "dare_linear", "dare_ties", "magnitude_prune", "sce"]:
                     target_lora_A.data, target_lora_B.data = self._generalized_task_arithmetic_weighted_adapter(
                         combination_type, adapters, weights, target, density, majority_sign_method
                     )
@@ -816,6 +815,7 @@ class LoraModel(BaseTuner):
         target,
         density,
         majority_sign_method,
+        **kwargs,
     ):
         # account weights for LoRA A and B layers.
         valid_weights = []
@@ -848,10 +848,8 @@ class LoraModel(BaseTuner):
                 lora_deltas[i] = dare_ties(task_tensors, valid_weights, density, majority_sign_method)
             elif combination_type == "magnitude_prune":
                 lora_deltas[i] = magnitude_prune(task_tensors, valid_weights, density)
-            elif combination_type == "sce_soft_merge":
-                lora_deltas[i] = sce_soft_merge(task_tensors, valid_weights, density)
             elif combination_type == "sce":
-                lora_deltas[i] = sce(task_tensors, valid_weights, density)
+                lora_deltas[i] = sce(task_tensors, valid_weights, density, majority_sign_method)
             else:
                 raise ValueError("Invalid combination type")
         lora_deltas = [delta.to(dtype) for delta in lora_deltas]

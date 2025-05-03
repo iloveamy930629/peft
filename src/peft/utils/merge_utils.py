@@ -310,121 +310,101 @@ def sce(task_tensors: List[torch.Tensor],
     return 
 """
 
+def sce(task_tensors, weights, density, majority_sign_method="total"):
 
-def sce(
-    task_tensors: List[torch.Tensor],       # LoRA delta tensors：δ_j
-    density: float = 0.1,                   # salient selection threshold τ
-) -> torch.Tensor:
-    """
-    Implements SCE-Merging algorithm from Zhang et al. (2024).
-    Step 1: Select salient elements (Select)
-    Step 2: Compute importance-based coefficients η
-    Step 3: Erase minority elements
-    Step 4: Merge into Φ
+    # stack: [num_tasks, ..., tensor_shape]
+    stacked = torch.stack(task_tensors, dim=0)
 
-    Returns:
-        merged_tensor: torch.Tensor
-    """
+    # 1. compute variance across task dimension
+    variances = torch.var(stacked, dim=0)  # shape: same as tensor
 
-    K = len(task_tensors)                             # number of tasks
-    shape = task_tensors[0].shape
-    device = task_tensors[0].device
+    # 2. flatten and get top-d indices
+    num_elements = variances.numel()
+    k = int(density * num_elements)
+    topk_vals, topk_indices = torch.topk(variances.view(-1), k)
+    mask = torch.zeros_like(variances.view(-1))
+    mask[topk_indices] = 1.0
+    mask = mask.view(variances.shape)
 
-    # Stack all task tensors: shape [K, ...]
-    delta_stack = torch.stack(task_tensors, dim=0)
+    # 3. weighted sum of task tensors
+    weighted_sum = sum(w * t for w, t in zip(weights, task_tensors))
 
-    # Step 1: Select salient positions (top-k by mean squared magnitude)
-    squared_stack = delta_stack ** 2
-    score = squared_stack.mean(dim=0)                # shape: [...]
-    k = int(density * score.numel())
-    threshold = torch.topk(score.view(-1), k)[0][-1]
-    salient_mask = (score >= threshold).float()      # shape: [...]
-
-    # Step 2: Compute merging coefficients η_j
-    importance_per_task = squared_stack * salient_mask  # only salient entries
-    total_importance = importance_per_task.sum()
-    task_importance = importance_per_task.sum(dim=list(range(1, importance_per_task.dim())))  # shape: [K]
-    eta = task_importance / (total_importance + 1e-8)   # shape: [K], η_j
-
-    # Step 3: Erase minority elements (each δ_j → δ_j′)
-    mean_sign = torch.sign(delta_stack.sum(dim=0))      # shape: [...]
-
-    # keep only matching signs with majority
-    filtered_stack = []
-    for j in range(K):
-        match_mask = (torch.sign(delta_stack[j]) == mean_sign).float()
-        filtered = delta_stack[j] * match_mask
-        filtered_stack.append(filtered)
-
-    filtered_stack = torch.stack(filtered_stack, dim=0)  # shape: [K, ...]
-
-    # Step 4: Weighted merge
-    eta = eta.view(-1, *([1] * (filtered_stack.dim() - 1)))  # reshape for broadcast
-    weighted_sum = (eta * filtered_stack).sum(dim=0)         # shape: [...]
-
-    return weighted_sum
-
-def sce_soft_merge(
-    task_tensors: List[torch.Tensor],
-    density: float = 0.1,
-    soft_fn: str = "sigmoid",  # or "softmax"
-    temp: float = 1.0,         # 溫度參數，用來控制 soft mask 的平滑程度
-) -> torch.Tensor:
-    """
-    SCE with soft merge: no hard erase, no binary salient mask.
-    Elements are softly weighted based on global importance and task-wise direction alignment.
-
-    Args:
-        task_tensors (List[Tensor]): LoRA deltas from each task.
-        density (float): Controls how steep the importance weighting is.
-        soft_fn (str): "sigmoid" or "softmax" for importance weighting.
-        temp (float): Temperature scaling for soft weighting.
-
-    Returns:
-        torch.Tensor: Merged delta tensor.
-    """
-
-    K = len(task_tensors)
-    shape = task_tensors[0].shape
-    device = task_tensors[0].device
-
-    delta_stack = torch.stack(task_tensors, dim=0)          # shape: [K, ...]
-    squared_stack = delta_stack ** 2                        # shape: [K, ...]
-
-    # Step 1: Compute global saliency score
-    global_score = squared_stack.mean(dim=0)                # shape: [...]
-
-    if soft_fn == "sigmoid":
-        # Normalize and apply sigmoid as soft mask
-        normed = (global_score - global_score.mean()) / (global_score.std() + 1e-8)
-        soft_mask = torch.sigmoid(normed / temp)            # range ~ 0 to 1
-    elif soft_fn == "softmax":
-        soft_mask = torch.softmax(global_score.view(-1) / temp, dim=0).view(shape)  # normalized importance
+    # 4. sign majority voting: erase conflicting elements
+    stacked_signs = torch.sign(stacked)
+    if majority_sign_method == "total":
+        majority = torch.sign(torch.sum(stacked_signs * weights.view(-1, 1, 1), dim=0))
+    elif majority_sign_method == "frequency":
+        majority = torch.sign(torch.sum(stacked_signs, dim=0))
     else:
-        raise ValueError("soft_fn must be 'sigmoid' or 'softmax'")
+        raise ValueError("Unknown majority_sign_method")
 
-    # Step 2: Compute task-level coefficients η_j (like original SCE)
-    weighted_importance = (squared_stack * soft_mask).sum(dim=list(range(1, squared_stack.dim())))  # shape: [K]
-    eta = weighted_importance / (weighted_importance.sum() + 1e-8)                                   # shape: [K]
-
-    # Step 3: Soft alignment weighting by agreement with majority sign
-    mean_sign = torch.sign(delta_stack.sum(dim=0))         # shape: [...]
-    aligned_stack = []
-
-    for j in range(K):
-        # agreement strength: +1 if aligned, -1 if not
-        align_factor = (torch.sign(delta_stack[j]) == mean_sign).float() * 2 - 1  # in {+1, -1}
-        aligned_tensor = delta_stack[j] * (1 + align_factor) / 2  # soft keep aligned, zero otherwise
-        aligned_stack.append(aligned_tensor)
-
-    aligned_stack = torch.stack(aligned_stack, dim=0)      # shape: [K, ...]
-
-    # Step 4: Apply soft mask + η weighted sum
-    eta = eta.view(-1, *([1] * (aligned_stack.dim() - 1)))  # shape: [K, 1, 1, ...]
-    weighted_sum = (eta * aligned_stack).sum(dim=0)
-    final_tensor = weighted_sum * soft_mask                # softly scaled output
+    final_tensor = weighted_sum * (torch.sign(weighted_sum) == majority).float()
+    final_tensor = final_tensor * mask  # apply pruning mask
 
     return final_tensor
+
+
+# def sce_soft_merge(
+#     task_tensors: List[torch.Tensor],
+#     density: float = 0.1,
+#     soft_fn: str = "sigmoid",  # or "softmax"
+#     temp: float = 1.0,         # 溫度參數，用來控制 soft mask 的平滑程度
+# ) -> torch.Tensor:
+#     """
+#     SCE with soft merge: no hard erase, no binary salient mask.
+#     Elements are softly weighted based on global importance and task-wise direction alignment.
+
+#     Args:
+#         task_tensors (List[Tensor]): LoRA deltas from each task.
+#         density (float): Controls how steep the importance weighting is.
+#         soft_fn (str): "sigmoid" or "softmax" for importance weighting.
+#         temp (float): Temperature scaling for soft weighting.
+
+#     Returns:
+#         torch.Tensor: Merged delta tensor.
+#     """
+
+#     K = len(task_tensors)
+#     shape = task_tensors[0].shape
+#     device = task_tensors[0].device
+
+#     delta_stack = torch.stack(task_tensors, dim=0)          # shape: [K, ...]
+#     squared_stack = delta_stack ** 2                        # shape: [K, ...]
+
+#     # Step 1: Compute global saliency score
+#     global_score = squared_stack.mean(dim=0)                # shape: [...]
+
+#     if soft_fn == "sigmoid":
+#         # Normalize and apply sigmoid as soft mask
+#         normed = (global_score - global_score.mean()) / (global_score.std() + 1e-8)
+#         soft_mask = torch.sigmoid(normed / temp)            # range ~ 0 to 1
+#     elif soft_fn == "softmax":
+#         soft_mask = torch.softmax(global_score.view(-1) / temp, dim=0).view(shape)  # normalized importance
+#     else:
+#         raise ValueError("soft_fn must be 'sigmoid' or 'softmax'")
+
+#     # Step 2: Compute task-level coefficients η_j (like original SCE)
+#     weighted_importance = (squared_stack * soft_mask).sum(dim=list(range(1, squared_stack.dim())))  # shape: [K]
+#     eta = weighted_importance / (weighted_importance.sum() + 1e-8)                                   # shape: [K]
+
+#     # Step 3: Soft alignment weighting by agreement with majority sign
+#     mean_sign = torch.sign(delta_stack.sum(dim=0))         # shape: [...]
+#     aligned_stack = []
+
+#     for j in range(K):
+#         # agreement strength: +1 if aligned, -1 if not
+#         align_factor = (torch.sign(delta_stack[j]) == mean_sign).float() * 2 - 1  # in {+1, -1}
+#         aligned_tensor = delta_stack[j] * (1 + align_factor) / 2  # soft keep aligned, zero otherwise
+#         aligned_stack.append(aligned_tensor)
+
+#     aligned_stack = torch.stack(aligned_stack, dim=0)      # shape: [K, ...]
+
+#     # Step 4: Apply soft mask + η weighted sum
+#     eta = eta.view(-1, *([1] * (aligned_stack.dim() - 1)))  # shape: [K, 1, 1, ...]
+#     weighted_sum = (eta * aligned_stack).sum(dim=0)
+#     final_tensor = weighted_sum * soft_mask                # softly scaled output
+
+#     return final_tensor
 
 
 def dare_linear(task_tensors: List[torch.Tensor], weights: torch.Tensor, density: float) -> torch.Tensor:

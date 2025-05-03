@@ -465,6 +465,7 @@ class IA3Model(BaseTuner):
         if adapter_name in list(self.peft_config.keys()):
             return
 
+        
         new_target_modules, new_feedforward_modules = self._check_add_weighted_adapter(
             adapters=adapters,
         )
