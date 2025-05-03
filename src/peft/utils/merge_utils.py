@@ -183,36 +183,115 @@ def magnitude_prune(task_tensors: List[torch.Tensor], weights: torch.Tensor, den
     return mixed_task_tensors
 
 
+# def ties(
+#     task_tensors: List[torch.Tensor],
+#     weights: torch.Tensor,
+#     density: float,
+#     majority_sign_method: Literal["total", "frequency"] = "total",
+# ) -> torch.Tensor:
+#     """
+#     Merge the task tensors using `ties`.
+
+#     Args:
+#         task_tensors(`List[torch.Tensor]`):The task tensors to merge.
+#         weights (`torch.Tensor`):The weights of the task tensors.
+#         density (`float`):The fraction of values to preserve. Should be in [0,1].
+#         majority_sign_method (`str`):
+#             The method to use to get the majority sign mask. Should be one of ["total", "frequency"].
+
+#     Returns:
+#         `torch.Tensor`: The merged tensor.
+#     """
+#     # sparsify
+#     task_tensors = [prune(tensor, density, method="magnitude") for tensor in task_tensors]
+#     task_tensors = torch.stack(task_tensors, dim=0)
+#     # Elect Sign
+#     majority_sign_mask = calculate_majority_sign_mask(task_tensors, method=majority_sign_method)
+#     # weighted task tensors
+#     weights = reshape_weight_task_tensors(task_tensors, weights)
+#     weighted_task_tensors = task_tensors * weights
+#     # Disjoint Merge
+#     mixed_task_tensors = disjoint_merge(weighted_task_tensors, majority_sign_mask)
+#     return mixed_task_tensors
+
+
 def ties(
-    task_tensors: List[torch.Tensor],
-    weights: torch.Tensor,
-    density: float,
+    task_tensors: List[torch.Tensor],              # τ_t：每個 LoRA delta tensor
+    weights: torch.Tensor,                         # α_t：任務的加權係數
+    density: float,                                # k：保留的密度比例（0~1）
     majority_sign_method: Literal["total", "frequency"] = "total",
 ) -> torch.Tensor:
     """
-    Merge the task tensors using `ties`.
-
-    Args:
-        task_tensors(`List[torch.Tensor]`):The task tensors to merge.
-        weights (`torch.Tensor`):The weights of the task tensors.
-        density (`float`):The fraction of values to preserve. Should be in [0,1].
-        majority_sign_method (`str`):
-            The method to use to get the majority sign mask. Should be one of ["total", "frequency"].
+    Implements TIES-Merging Algorithm (Ilharco et al. 2022), with 3 stages:
+    1. Trim (sparsify each τ_t)
+    2. Elect Sign (final γ_m)
+    3. Disjoint Merge (合併相容符號的 task tensor)
 
     Returns:
-        `torch.Tensor`: The merged tensor.
+        merged_tensor: torch.Tensor  (τ_m)
     """
-    # sparsify
-    task_tensors = [prune(tensor, density, method="magnitude") for tensor in task_tensors]
-    task_tensors = torch.stack(task_tensors, dim=0)
-    # Elect Sign
-    majority_sign_mask = calculate_majority_sign_mask(task_tensors, method=majority_sign_method)
-    # weighted task tensors
-    weights = reshape_weight_task_tensors(task_tensors, weights)
-    weighted_task_tensors = task_tensors * weights
-    # Disjoint Merge
-    mixed_task_tensors = disjoint_merge(weighted_task_tensors, majority_sign_mask)
-    return mixed_task_tensors
+
+    num_tasks = len(task_tensors)
+    shape = task_tensors[0].shape
+    device = task_tensors[0].device
+
+    # Step 1: Trim redundant parameters (個別 task 剪枝)
+    trimmed_tensors = []      # τ̂_t
+    signs_list = []           # γ̂_t
+
+    for t in range(num_tasks):
+        τ_t = task_tensors[t]
+        τ_t = weights[t] * τ_t  # 套用任務加權係數 α_t
+
+        # ➤ 對每個 tensor 取絕對值並找出 top-k 個位置 (按 density 定義的 k%)
+        k = int(density * τ_t.numel())
+        flat = τ_t.abs().view(-1)
+        if k == 0:
+            mask = torch.zeros_like(flat, dtype=torch.bool)
+        else:
+            threshold = torch.topk(flat, k)[0][-1]
+            mask = (flat >= threshold)
+
+        # ➤ 用 mask 保留重要位置，其餘設為 0
+        τ_hat = torch.zeros_like(flat)
+        τ_hat[mask] = flat[mask] * torch.sign(τ_t.view(-1))[mask]
+        τ_hat = τ_hat.view(shape)
+        trimmed_tensors.append(τ_hat)
+
+        # ➤ 儲存 sign(τ̂_t)
+        signs_list.append(torch.sign(τ_hat))
+
+    trimmed_stack = torch.stack(trimmed_tensors, dim=0)  # shape: (n, ...)
+    signs_stack = torch.stack(signs_list, dim=0)         # shape: (n, ...)
+
+    # Step 2: Elect Final Sign γ_m
+    if majority_sign_method == "total":
+        γ_m = torch.sign(trimmed_stack.sum(dim=0))  # sum vote
+    elif majority_sign_method == "frequency":
+        # frequency vote: 多數決
+        signs_sum = signs_stack.sum(dim=0)
+        γ_m = torch.sign(signs_sum)
+    else:
+        raise ValueError("Invalid majority_sign_method")
+
+    # Step 3: Disjoint Merge (只合併 γ̂_t 和 γ_m 一致的元素)
+    merged_tensor = torch.zeros_like(trimmed_stack[0])
+
+    for t in range(num_tasks):
+        γ_hat_t = signs_list[t]
+        τ_hat_t = trimmed_tensors[t]
+
+        # mask 出與最終 sign γ_m 相同的位置
+        agree_mask = (γ_hat_t == γ_m).float()
+
+        # 加總相容 task tensor 的值
+        merged_tensor += τ_hat_t * agree_mask
+
+    # 平均化（除以每個位置的支持數）
+    agree_count = (signs_stack == γ_m).sum(dim=0).clamp(min=1)  # 防止除以 0
+    merged_tensor /= agree_count
+
+    return merged_tensor
 
 
 #### Todo: Add new methods, reuse modules in other algorithms ####
@@ -230,6 +309,122 @@ def sce(task_tensors: List[torch.Tensor],
 
     return 
 """
+
+
+def sce(
+    task_tensors: List[torch.Tensor],       # LoRA delta tensors：δ_j
+    density: float = 0.1,                   # salient selection threshold τ
+) -> torch.Tensor:
+    """
+    Implements SCE-Merging algorithm from Zhang et al. (2024).
+    Step 1: Select salient elements (Select)
+    Step 2: Compute importance-based coefficients η
+    Step 3: Erase minority elements
+    Step 4: Merge into Φ
+
+    Returns:
+        merged_tensor: torch.Tensor
+    """
+
+    K = len(task_tensors)                             # number of tasks
+    shape = task_tensors[0].shape
+    device = task_tensors[0].device
+
+    # Stack all task tensors: shape [K, ...]
+    delta_stack = torch.stack(task_tensors, dim=0)
+
+    # Step 1: Select salient positions (top-k by mean squared magnitude)
+    squared_stack = delta_stack ** 2
+    score = squared_stack.mean(dim=0)                # shape: [...]
+    k = int(density * score.numel())
+    threshold = torch.topk(score.view(-1), k)[0][-1]
+    salient_mask = (score >= threshold).float()      # shape: [...]
+
+    # Step 2: Compute merging coefficients η_j
+    importance_per_task = squared_stack * salient_mask  # only salient entries
+    total_importance = importance_per_task.sum()
+    task_importance = importance_per_task.sum(dim=list(range(1, importance_per_task.dim())))  # shape: [K]
+    eta = task_importance / (total_importance + 1e-8)   # shape: [K], η_j
+
+    # Step 3: Erase minority elements (each δ_j → δ_j′)
+    mean_sign = torch.sign(delta_stack.sum(dim=0))      # shape: [...]
+
+    # keep only matching signs with majority
+    filtered_stack = []
+    for j in range(K):
+        match_mask = (torch.sign(delta_stack[j]) == mean_sign).float()
+        filtered = delta_stack[j] * match_mask
+        filtered_stack.append(filtered)
+
+    filtered_stack = torch.stack(filtered_stack, dim=0)  # shape: [K, ...]
+
+    # Step 4: Weighted merge
+    eta = eta.view(-1, *([1] * (filtered_stack.dim() - 1)))  # reshape for broadcast
+    weighted_sum = (eta * filtered_stack).sum(dim=0)         # shape: [...]
+
+    return weighted_sum
+
+def sce_soft_merge(
+    task_tensors: List[torch.Tensor],
+    density: float = 0.1,
+    soft_fn: str = "sigmoid",  # or "softmax"
+    temp: float = 1.0,         # 溫度參數，用來控制 soft mask 的平滑程度
+) -> torch.Tensor:
+    """
+    SCE with soft merge: no hard erase, no binary salient mask.
+    Elements are softly weighted based on global importance and task-wise direction alignment.
+
+    Args:
+        task_tensors (List[Tensor]): LoRA deltas from each task.
+        density (float): Controls how steep the importance weighting is.
+        soft_fn (str): "sigmoid" or "softmax" for importance weighting.
+        temp (float): Temperature scaling for soft weighting.
+
+    Returns:
+        torch.Tensor: Merged delta tensor.
+    """
+
+    K = len(task_tensors)
+    shape = task_tensors[0].shape
+    device = task_tensors[0].device
+
+    delta_stack = torch.stack(task_tensors, dim=0)          # shape: [K, ...]
+    squared_stack = delta_stack ** 2                        # shape: [K, ...]
+
+    # Step 1: Compute global saliency score
+    global_score = squared_stack.mean(dim=0)                # shape: [...]
+
+    if soft_fn == "sigmoid":
+        # Normalize and apply sigmoid as soft mask
+        normed = (global_score - global_score.mean()) / (global_score.std() + 1e-8)
+        soft_mask = torch.sigmoid(normed / temp)            # range ~ 0 to 1
+    elif soft_fn == "softmax":
+        soft_mask = torch.softmax(global_score.view(-1) / temp, dim=0).view(shape)  # normalized importance
+    else:
+        raise ValueError("soft_fn must be 'sigmoid' or 'softmax'")
+
+    # Step 2: Compute task-level coefficients η_j (like original SCE)
+    weighted_importance = (squared_stack * soft_mask).sum(dim=list(range(1, squared_stack.dim())))  # shape: [K]
+    eta = weighted_importance / (weighted_importance.sum() + 1e-8)                                   # shape: [K]
+
+    # Step 3: Soft alignment weighting by agreement with majority sign
+    mean_sign = torch.sign(delta_stack.sum(dim=0))         # shape: [...]
+    aligned_stack = []
+
+    for j in range(K):
+        # agreement strength: +1 if aligned, -1 if not
+        align_factor = (torch.sign(delta_stack[j]) == mean_sign).float() * 2 - 1  # in {+1, -1}
+        aligned_tensor = delta_stack[j] * (1 + align_factor) / 2  # soft keep aligned, zero otherwise
+        aligned_stack.append(aligned_tensor)
+
+    aligned_stack = torch.stack(aligned_stack, dim=0)      # shape: [K, ...]
+
+    # Step 4: Apply soft mask + η weighted sum
+    eta = eta.view(-1, *([1] * (aligned_stack.dim() - 1)))  # shape: [K, 1, 1, ...]
+    weighted_sum = (eta * aligned_stack).sum(dim=0)
+    final_tensor = weighted_sum * soft_mask                # softly scaled output
+
+    return final_tensor
 
 
 def dare_linear(task_tensors: List[torch.Tensor], weights: torch.Tensor, density: float) -> torch.Tensor:
