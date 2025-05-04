@@ -294,6 +294,56 @@ def ties(
     return merged_tensor
 
 
+def ties_global_trim(
+    task_tensors: List[torch.Tensor],
+    weights: torch.Tensor,
+    density: float,
+    majority_sign_method: Literal["total", "frequency"] = "total",
+) -> torch.Tensor:
+    """
+    Variant of TIES-Merging with Global Trim:
+    1. Weighted Sum → Global Top-K Prune
+    2. Elect Majority Sign
+    3. Disjoint Merge
+    """
+
+    num_tasks = len(task_tensors)
+    device = task_tensors[0].device
+    shape = task_tensors[0].shape
+
+    # Step 1: Weighted Sum of Task Vectors
+    weighted_tensors = [w * t for w, t in zip(weights, task_tensors)]
+    sum_tensor = sum(weighted_tensors)
+
+    # Global Trim (on sum_tensor)
+    k = int(density * sum_tensor.numel())
+    flat = sum_tensor.abs().view(-1)
+    threshold = torch.topk(flat, k)[0][-1]
+    global_mask = (flat >= threshold).view(shape).float()
+
+    # Step 2: Elect Sign (γ_m)
+    stacked_signs = torch.stack([torch.sign(w * t) for w, t in zip(weights, task_tensors)], dim=0)
+    if majority_sign_method == "total":
+        γ_m = torch.sign(torch.sum(stacked_signs, dim=0))
+    elif majority_sign_method == "frequency":
+        γ_m = torch.sign(torch.sum(stacked_signs, dim=0))
+    else:
+        raise ValueError("Invalid majority_sign_method")
+
+    # Step 3: Disjoint Merge
+    merged_tensor = torch.zeros_like(task_tensors[0])
+    for w, t in zip(weights, task_tensors):
+        sign_t = torch.sign(w * t)
+        agree_mask = (sign_t == γ_m).float()
+        merged_tensor += w * t * agree_mask
+
+    agree_count = (stacked_signs == γ_m).sum(dim=0).clamp(min=1)
+    merged_tensor /= agree_count
+    merged_tensor *= global_mask
+
+    return merged_tensor
+
+
 #### Todo: Add new methods, reuse modules in other algorithms ####
 #### e.g. if you want to implement “sce” algorithm ####
 """
