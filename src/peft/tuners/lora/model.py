@@ -153,19 +153,19 @@ class LoraModel(BaseTuner):
         """
         # TODO: there should be a check if any of the existing adapters actually has bias != "none", or else the check
         # does not fully correspond to the error message.
-        # if (len(self.peft_config) > 1) and (config.bias != "none"):
-        #     raise ValueError(
-        #         f"{self.__class__.__name__} supports only 1 adapter with bias. When using multiple adapters, "
-        #         "set bias to 'none' for all adapters."
-        #     )
-        if config.bias != "none":
-            for adapter_name, existing_config in self.peft_config.items():
-                if existing_config.bias != "none":
-                    raise ValueError(
-                        f"{self.__class__.__name__} supports only one adapter with bias. "
-                        f"Existing adapter '{adapter_name}' has bias '{existing_config.bias}', "
-                        f"so new adapter must use bias='none'."
-                    )
+        if (len(self.peft_config) > 1) and (config.bias != "none"):
+            raise ValueError(
+                f"{self.__class__.__name__} supports only 1 adapter with bias. When using multiple adapters, "
+                "set bias to 'none' for all adapters."
+            )
+        # if config.bias != "none":
+        #     for adapter_name, existing_config in self.peft_config.items():
+        #         if existing_config.bias != "none":
+        #             raise ValueError(
+        #                 f"{self.__class__.__name__} supports only one adapter with bias. "
+        #                 f"Existing adapter '{adapter_name}' has bias '{existing_config.bias}', "
+        #                 f"so new adapter must use bias='none'."
+        #             )
 
     @staticmethod
     def _check_target_module_exists(lora_config, key):
