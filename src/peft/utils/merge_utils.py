@@ -456,6 +456,7 @@ def sce_mask(task_tensors: torch.Tensor, density: float, mask_dtype: Optional[to
 def sce(
     task_tensors: List[torch.Tensor],
     density: float,
+    weights: Optional[List[float]] = None,    
     majority_sign_method: Literal["total", "frequency"] = "total",
 ) -> torch.Tensor:
     """
