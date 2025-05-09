@@ -851,7 +851,7 @@ class LoraModel(BaseTuner):
             elif combination_type == "magnitude_prune":
                 lora_deltas[i] = magnitude_prune(task_tensors, valid_weights, density)
             elif combination_type == "sce":
-                lora_deltas[i] = sce(task_tensors, valid_weights, density, majority_sign_method)
+                lora_deltas[i] = sce(task_tensors, density, majority_sign_method)
             elif combination_type == "ties_global_trim":
                  lora_deltas[i] = ties_global_trim(task_tensors, valid_weights, density, majority_sign_method)
 

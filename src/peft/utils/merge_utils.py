@@ -423,39 +423,107 @@ def sce(task_tensors: List[torch.Tensor],
 
     return 
 """
+def sce_weight(task_tensors: torch.Tensor) -> torch.Tensor:
+    # Compute squared magnitude (energy) per task vector
+    weights = torch.mean(task_tensors**2, dim=list(range(1, task_tensors.dim())))
+    weight_sum = torch.sum(weights).item()
+    
+    # Handle edge case: all-zero task tensors
+    if abs(weight_sum) < 1e-6:
+        return torch.ones_like(weights) / weights.shape[0]
+    
+    # Normalize to probability distribution
+    return weights / weight_sum
 
-def sce(task_tensors, weights, density, majority_sign_method="total"):
+def sce_mask(task_tensors: torch.Tensor, density: float, mask_dtype: Optional[torch.dtype] = None):
+    # S step: select top-k parameters by variance
+    if density <= 0:
+        return torch.zeros_like(task_tensors[0], dtype=mask_dtype)
+    if density >= 1:
+        return torch.ones_like(task_tensors[0], dtype=mask_dtype)
+    
+    var = torch.var(task_tensors, dim=0, unbiased=False)
+    nonzero = torch.count_nonzero(var)
+    k = int(nonzero * density)
+    if k == 0:
+        return torch.zeros_like(task_tensors[0], dtype=mask_dtype)
+    
+    _, indices = torch.topk(var.abs().view(-1), k=k, largest=True)
+    mask = torch.zeros_like(var, dtype=mask_dtype)
+    mask.view(-1)[indices] = 1
+    return mask
 
-    # stack: [num_tasks, ..., tensor_shape]
-    stacked = torch.stack(task_tensors, dim=0)
+def sce(
+    task_tensors: List[torch.Tensor],
+    density: float,
+    majority_sign_method: Literal["total", "frequency"] = "total",
+) -> torch.Tensor:
+    """
+    SCE merging algorithm implementation.
+    Inputs:
+        - task_tensors: list of T tensors, each with shape (A, B)
+        - density: float between 0 and 1, proportion of top-k variance to keep
+        - majority_sign_method: not used here, kept for API compatibility
+    Returns:
+        - merged tensor of shape (A, B)
+    """
+    T = len(task_tensors)
+    device = task_tensors[0].device
+    dtype = task_tensors[0].dtype
 
-    # 1. compute variance across task dimension
-    variances = torch.var(stacked, dim=0)  # shape: same as tensor
+    # Stack into shape (T, A, B)
+    task_tensor_stack = torch.stack(task_tensors, dim=0)  # (T, A, B)
 
-    # 2. flatten and get top-d indices
-    num_elements = variances.numel()
-    k = int(density * num_elements)
-    topk_vals, topk_indices = torch.topk(variances.view(-1), k)
-    mask = torch.zeros_like(variances.view(-1))
-    mask[topk_indices] = 1.0
-    mask = mask.view(variances.shape)
+    # Step 1: Compute weights (C step)
+    weights = sce_weight(task_tensor_stack).to(device=device, dtype=dtype)  # (T,)
 
-    # 3. weighted sum of task tensors
-    weighted_sum = sum(w * t for w, t in zip(weights, task_tensors))
+    # Step 2: Compute mask (S step)
+    mask = sce_mask(task_tensor_stack, density, mask_dtype=dtype)  # (A, B)
 
-    # 4. sign majority voting: erase conflicting elements
-    stacked_signs = torch.sign(stacked)
-    if majority_sign_method == "total":
-        majority = torch.sign(torch.sum(stacked_signs * weights.view(-1, 1, 1), dim=0))
-    elif majority_sign_method == "frequency":
-        majority = torch.sign(torch.sum(stacked_signs, dim=0))
-    else:
-        raise ValueError("Unknown majority_sign_method")
+    # Step 3: Erase minority direction (E step)
+    signed_sum = torch.sum(torch.sign(task_tensor_stack), dim=0)  # (A, B)
+    majority_sign = torch.sign(signed_sum)  # sign aggregation
 
-    final_tensor = weighted_sum * (torch.sign(weighted_sum) == majority).float()
-    final_tensor = final_tensor * mask  # apply pruning mask
+    # Weighted sum of task tensors
+    weighted_sum = torch.sum(weights.view(T, 1, 1) * task_tensor_stack, dim=0)  # (A, B)
 
-    return final_tensor
+    # Apply mask and majority sign
+    merged = weighted_sum * mask * majority_sign
+
+    return merged
+
+# def sce(task_tensors, weights, density, majority_sign_method="total"):
+
+#     # stack: [num_tasks, ..., tensor_shape]
+#     stacked = torch.stack(task_tensors, dim=0)
+
+#     # 1. compute variance across task dimension
+#     variances = torch.var(stacked, dim=0)  # shape: same as tensor
+
+#     # 2. flatten and get top-d indices
+#     num_elements = variances.numel()
+#     k = int(density * num_elements)
+#     topk_vals, topk_indices = torch.topk(variances.view(-1), k)
+#     mask = torch.zeros_like(variances.view(-1))
+#     mask[topk_indices] = 1.0
+#     mask = mask.view(variances.shape)
+
+#     # 3. weighted sum of task tensors
+#     weighted_sum = sum(w * t for w, t in zip(weights, task_tensors))
+
+#     # 4. sign majority voting: erase conflicting elements
+#     stacked_signs = torch.sign(stacked)
+#     if majority_sign_method == "total":
+#         majority = torch.sign(torch.sum(stacked_signs * weights.view(-1, 1, 1), dim=0))
+#     elif majority_sign_method == "frequency":
+#         majority = torch.sign(torch.sum(stacked_signs, dim=0))
+#     else:
+#         raise ValueError("Unknown majority_sign_method")
+
+#     final_tensor = weighted_sum * (torch.sign(weighted_sum) == majority).float()
+#     final_tensor = final_tensor * mask  # apply pruning mask
+
+#     return final_tensor
 
 
 # def sce_soft_merge(
